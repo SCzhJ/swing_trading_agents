@@ -1,121 +1,97 @@
-from openai import OpenAI
-# from .config import get_config # no longer needed
+from pathlib import Path
+project_root = None
+for parent in [Path.cwd(), *Path.cwd().parents]:
+    if (parent / "pyproject.toml").exists():
+        project_root = parent
+        break
+if project_root is None:
+    raise FileNotFoundError("pyproject.toml 未找到，无法确定项目根目录")
+
+import sys
+if str(project_root) not in sys.path:
+    sys.path.append(str(project_root))
+
 import os
-import dotenv
-import json
-from datetime import datetime, timedelta
-import time
-import random
+from openai import AsyncOpenAI
+from b_provider_adapter.token_controller import TokenController
+from dashscope.aigc.generation import AioGeneration
+import dashscope
 
-dotenv.load_dotenv()
-# 使用 Moonshot API Key
-MOONSHOT_API_KEY = os.getenv("MOONSHOT_API_KEY")
 
-def chat_with_websearch(messages, model="kimi-k2-0905-preview"):
-    """处理带有联网搜索的对话流程"""
-    finish_reason = None
-    final_response = None
-
-    client = OpenAI(
-        api_key=MOONSHOT_API_KEY,
-        base_url="https://api.moonshot.cn/v1"  # Moonshot API 端点
+async def dashscope_websearch(token_controller: TokenController, 
+                              query: str, 
+                              model: str = "qwen3-max", 
+                              max_tokens: int = 2048, 
+                              extra_body: dict = {
+                                  "enable_search": True,
+                                  "search_options": {
+                                      "forced_search": True,  # Force a web search
+                                      "enable_search_extension": True,
+                                      }
+                                  },
+                              base_url: str = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1" 
+                              ) -> str:
+    """
+    使用Dashscope API进行Web搜索
+    """
+    client = AsyncOpenAI(
+        api_key=os.getenv("DASHSCOPE_API_KEY"),
+        base_url=base_url
     )
-    
-    while finish_reason is None or finish_reason == "tool_calls":
-        completion = client.chat.completions.create(
+    async with token_controller.acquire_slot(query, max_tokens) as ctx:
+        # 在上下文内调用API
+        response = await client.chat.completions.create(
             model=model,
-            messages=messages,
-            temperature=0.6,
-            tools=[
-                {
-                    "type": "builtin_function",
-                    "function": {
-                        "name": "$web_search",
-                    },
-                }
-            ]
+            messages=[{"role": "user", "content": ctx.prompt}],
+            max_tokens=ctx.max_output_token,
+            extra_body=extra_body
         )
         
-        choice = completion.choices[0]
-        finish_reason = choice.finish_reason
+        # 设置结果
+        ctx.set_result(
+            input_tokens=response.usage.prompt_tokens,
+            output_tokens=response.usage.completion_tokens,
+            result=response
+        )
         
-        if finish_reason == "tool_calls":
-            messages.append(choice.message)
-            for tool_call in choice.message.tool_calls:
-                tool_call_name = tool_call.function.name
-                tool_call_arguments = json.loads(tool_call.function.arguments)
-                
-                if tool_call_name == "$web_search":
-                    # Moonshot 内置的 $web_search 只需要返回参数即可
-                    tool_result = tool_call_arguments
-                else:
-                    tool_result = f"Error: unable to find tool by name '{tool_call_name}'"
-
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "name": tool_call_name,
-                    "content": json.dumps(tool_result),
-                })
-        else:
-            final_response = choice.message.content
+        # 获取结果
+        result = ctx.result
+    return result
     
-    return final_response
+async def dashscope_websearch_with_source(token_controller: TokenController, 
+                                          query: str, 
+                                          model: str = "qwen3-max", 
+                                          max_tokens: int = 4096, 
+                                          search_options={
+                                              "enable_source": True,       # Must be enabled to use superscript annotations 
+                                              "enable_citation": True,     # Enable superscript annotations 
+                                              "citation_format": "[ref_<number>]", # Set the superscript style 
+                                            },
+                                          base_url: str = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1" 
+                                          ) -> str:
+    """
+    使用Dashscope API进行Web搜索
+    """
+    dashscope.base_http_api_url = 'https://dashscope-intl.aliyuncs.com/api/v1'
+    async with token_controller.acquire_slot(query, max_tokens) as ctx:
+        # 在上下文内调用API
+        response = await AioGeneration.call(
+            api_key=os.getenv("DASHSCOPE_API_KEY"),
+            model="qwen-plus",  # For a list of models, see https://www.alibabacloud.com/help/en/model-studio/models
+            messages=[{"role": "system", "content": "You are a helpful assistant."},
+                      {"role": "user", "content": query}],
+            search_options=search_options,
+            result_format="message",
+            )
+        
+        # 设置结果
+        ctx.set_result(
+            input_tokens=response.usage.prompt_tokens,
+            output_tokens=response.usage.completion_tokens,
+            result=response
+        )
+        
+        # 获取结果
+        result = ctx.result
+    return result
 
-def chat_with_websearch_and_retry(messages, model="kimi-k2-0905-preview", max_attempt=5):
-    for attempt in range(1, max_attempt + 1):
-        try:
-            return chat_with_websearch(messages, model)
-        except openai.APITimeoutError as e:
-            wait = 2 ** attempt + random.uniform(0, 1)
-            print(f"[{attempt}/{max_attempt}] 请求超时，{wait:.1f}s 后重试…")
-            time.sleep(wait)
-    raise RuntimeError("多次重试后仍无法连接 Moonshot API")
-
-def get_stock_news_kimi(symbol, start_date, end_date):
-    curr_date = datetime.strptime(curr_date, "%Y-%m-%d")
-    start_date = (curr_date - timedelta(days=look_back_days))
-    # get the month name in english 
-    month_name1 = start_date.strftime("%B")
-    month_name2 = curr_date.strftime("%B")
-    date_range = f"{start_date.strftime('%Y')} {month_name1} {start_date.strftime('%d')} to {curr_date.strftime('%Y')} {month_name2} {curr_date.strftime('%d')}"
-    messages = [
-        {
-            "role": "system", 
-            "content": "You are a professional financial analyst skilled in searching and analyzing stock-related information."
-        },
-        {
-            "role": "user",
-            "content": f"Can you search Social Media News for stock \"{symbol}\" between {date_range}? Make sure you only get the data posted during that period."
-        }
-    ]
-
-    response = chat_with_websearch_and_retry(messages, "kimi-k2-0905-preview")
-    return response
-
-def get_global_news_kimi(curr_date, look_back_days=7, limit=5):
-    curr_date = datetime.strptime(curr_date, "%Y-%m-%d")
-    start_date = (curr_date - timedelta(days=look_back_days))
-    # get the month name in english 
-    month_name1 = start_date.strftime("%B")
-    month_name2 = curr_date.strftime("%B")
-    date_range = f"{start_date.strftime('%Y')} {month_name1} {start_date.strftime('%d')} to {curr_date.strftime('%Y')} {month_name2} {curr_date.strftime('%d')}"
-    
-    messages = [
-        {
-            "role": "system",
-            "content": "You are a professional macroeconomic analyst skilled in searching and analyzing global news."
-        },
-        {
-            "role": "user",
-            "content": f"Can you search global or macroeconomics news between {date_range} that would be informative for trading purposes? Make sure you only get the data posted during that period. Limit the results to {limit} articles."
-        }
-    ]
-
-    response = chat_with_websearch_and_retry(messages, "kimi-k2-0905-preview")
-    return response
-
-
-if __name__ == "__main__":
-    # print(get_stock_news_kimi("TSLA", "2025-10-01", "2025-10-07"))
-    print(get_global_news_kimi("2025-10-07"))

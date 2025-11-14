@@ -4,7 +4,7 @@ import time
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Deque, Dict, Optional, Tuple, Callable, Any, Type
+from typing import Deque, Dict, Optional, Tuple, Callable, Any, Type, List
 from contextlib import asynccontextmanager
 import logging
 
@@ -49,9 +49,12 @@ class RequestContext:
     _result: Optional[Any] = None
     _input_tokens: Optional[int] = None
     _output_tokens: Optional[int] = None
+    _exited: bool = False
     
     def set_result(self, *, input_tokens: int, output_tokens: int, result: Any):
         """设置API调用结果"""
+        if self._exited:
+            raise RuntimeError("Cannot set result after context exit!")
         self._input_tokens = input_tokens
         self._output_tokens = output_tokens
         self._result = result
@@ -142,17 +145,26 @@ class TokenController:
         
         async with self.lock:
             expired_records = 0
+            skipped_est_count = 0
+            
+            temp_est_deque = deque()
+
             while self.records and self.records[0].timestamp < cutoff_time:
                 record = self.records.popleft()
-                expired_records += 1
-                self._tpm_counter -= (record.input_tokens + record.output_tokens)
-                if not record.estimate:
+                if record.estimate:
+                    temp_est_deque.append(record)
+                    skipped_est_count += 1
+                else:
+                    self._tpm_counter -= (record.input_tokens + record.output_tokens)
                     self._rpm_counter -= 1
-            
-            if expired_records > 0:
-                self.logger.debug(
-                    f"Cleaned up {expired_records} records, "
-                    f"TPM={self._tpm_counter}, RPM={self._rpm_counter}"
+                    expired_records += 1
+
+            if temp_est_deque:
+                self.records.extendleft(reversed(temp_est_deque)) 
+            if expired_records > 0 or skipped_est_count > 0:
+                self.logger.info(
+                    f"Expiring cleanup: removed {expired_records} real records, "
+                    f"skipped {skipped_est_count} estimate records"
                 )
 
     def _get_current_load(self) -> Tuple[int, int, int]:
@@ -211,6 +223,7 @@ class TokenController:
             f"max_output={max_output_token}, required={required_tokens}"
         )
         
+        # 问一下ai以下可不可行
         await self._wait_for_capacity(required_tokens, call_id)
         await self.semaphore.acquire()
         
@@ -225,6 +238,7 @@ class TokenController:
         async with self.lock:
             self.records.append(record)
             self._tpm_counter += (input_est + max_output_token)
+            self._rpm_counter += 1
             self.in_flight[call_id] = asyncio.current_task()
         
         self.logger.debug(f"Request {call_id} approved and locked")
@@ -256,7 +270,6 @@ class TokenController:
                     self.records[i] = real_record
                     found = True
                     self._tpm_counter += token_delta
-                    self._rpm_counter += 1
                     
                     self.logger.debug(
                         f"Replaced {call_id}: {old_tokens} -> {new_tokens} "
@@ -265,10 +278,11 @@ class TokenController:
                     break
             
             if not found:
-                self.logger.warning(f"Record {call_id} not found for replacement")
-                self.records.append(real_record)
-                self._tpm_counter += (actual_input_tokens + actual_output_tokens)
-                self._rpm_counter += 1
+                raise ValueError(f"Record {call_id} not found for replacement")
+                # Logic without raising exception:
+                # self.logger.warning(f"Record {call_id} not found for replacement")
+                # self.records.append(real_record)
+                # self._tpm_counter += (actual_input_tokens + actual_output_tokens)
             
             self.in_flight.pop(call_id, None)
         
@@ -283,8 +297,7 @@ class TokenController:
             
             for rec in matching:
                 self._tpm_counter -= (rec.input_tokens + rec.output_tokens)
-                if not rec.estimate:
-                    self._rpm_counter -= 1
+                self._rpm_counter -= 1
             
             was_in_flight = self.in_flight.pop(call_id, None) is not None
         
@@ -299,7 +312,7 @@ class TokenController:
     @asynccontextmanager
     async def acquire_slot(
         self,
-        prompt: str,
+        prompt: str | List[Dict[str, str]],
         max_output_token: int,
         retry_config: Optional[RetryConfig] = None
     ):
@@ -322,6 +335,7 @@ class TokenController:
             - 如果用户在with块内抛出异常，也会自动清理
         """
         config = retry_config or self.retry_config
+        prompt = str(prompt)
         
         # 重试循环
         last_exception = None
@@ -348,15 +362,22 @@ class TokenController:
                 # 阶段2：执行用户代码（在with块内）
                 yield ctx
                 
-                # 阶段3：如果用户设置了结果，更新记录
-                if ctx.has_result:
-                    await self.wait_after_call_if_needed(
-                        call_id,
-                        ctx.input_tokens,
-                        ctx.output_tokens
-                    )
-                    self.logger.info(f"✅ Request {call_id} succeeded on attempt {attempt}")
-                
+                if not ctx.has_result:
+                    # 用户没有调用set_result，这是编程错误
+                    raise RuntimeError(
+                        f"Request {call_id}: ctx.set_result() was never called! "
+                        f"You must call ctx.set_result(input_tokens=..., output_tokens=..., result=...) "
+                        f"within the 'async with' block."
+                        )
+
+                await self.wait_after_call_if_needed(
+                    call_id,
+                    ctx.input_tokens,
+                    ctx.output_tokens
+                )
+                self.logger.info(f"✅ Request {call_id} succeeded on attempt {attempt}")
+
+                ctx._exited = True
                 # 成功，退出重试循环
                 break
                 
@@ -381,12 +402,14 @@ class TokenController:
                     self.logger.error(
                         f"💥 All {config.max_attempts} attempts failed for '{prompt[:30]}...'"
                     )
+                    ctx._exited = True
                     raise  # 重试耗尽，抛出异常
                     
             except Exception:
                 # 非预期异常，立即清理并抛出
                 if call_id:
                     await self.cleanup_call(call_id)
+                ctx._exited = True
                 raise
         
         else:

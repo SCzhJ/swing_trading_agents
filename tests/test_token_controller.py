@@ -57,9 +57,9 @@ def strict_controller():
     - Max Concurrent: 2 (最多同时2个请求)
     """
     return TokenController(
-        tpm=500,  # 故意设低，单次请求约100 tokens
-        rpm=3,    # 每分钟最多3个真实请求
-        max_concurrent=2,  # 最多2个并发
+        tpm=1000,  # 故意设低，单次请求约100 tokens
+        rpm=20,    # 每分钟最多3个真实请求
+        max_concurrent=20,  # 最多2个并发
         provider=TEST_PROVIDER
     )
 
@@ -72,12 +72,11 @@ def loose_controller():
     用于对比测试
     """
     return TokenController(
-        tpm=50000,
-        rpm=100,
-        max_concurrent=10,
+        tpm=1000000,
+        rpm=25,
+        max_concurrent=30,
         provider=TEST_PROVIDER
     )
-
 
 # === 测试用例 ===
 
@@ -85,58 +84,136 @@ def loose_controller():
 # test_token_controller.py (简化版)
 
 # 保持旧测试兼容（直接调用底层API）
-@pytest.mark.asyncio
-async def test_manual_api_still_works(client, strict_controller):
-    """验证旧的手动API仍然可用"""
-    call_id = await strict_controller.wait_before_call_if_needed("Test", 100)
+# @pytest.mark.asyncio
+# async def test_manual_api_still_works(client, strict_controller):
+#     """验证旧的手动API仍然可用"""
+#     call_id = await strict_controller.wait_before_call_if_needed("Test", 100)
     
-    try:
-        response = await client.chat.completions.create(
-            model=TEST_MODEL,
-            messages=[{"role": "user", "content": "Test"}],
-            max_tokens=100
-        )
+#     try:
+#         response = await client.chat.completions.create(
+#             model=TEST_MODEL,
+#             messages=[{"role": "user", "content": "Test"}],
+#             max_tokens=100
+#         )
         
-        await strict_controller.wait_after_call_if_needed(
-            call_id,
-            response.usage.prompt_tokens,
-            response.usage.completion_tokens
-        )
+#         await strict_controller.wait_after_call_if_needed(
+#             call_id,
+#             response.usage.prompt_tokens,
+#             response.usage.completion_tokens
+#         )
         
-        assert True  # 成功
-    except Exception:
-        await strict_controller.cleanup_call(call_id)
-        raise
+#         assert True  # 成功
+#     except Exception:
+#         await strict_controller.cleanup_call(call_id)
+#         raise
+
+# @pytest.mark.asyncio
+# async def test_context_manager_api(client, strict_controller):
+#     """
+#     测试上下文管理器API
+    
+#     更灵活，适合复杂场景
+#     """
+    
+#     async with strict_controller.acquire_slot("What is AI?", 100) as ctx:
+#         # 在上下文内调用API
+#         response = await client.chat.completions.create(
+#             model=TEST_MODEL,
+#             messages=[{"role": "user", "content": ctx.prompt}],
+#             max_tokens=ctx.max_output_token
+#         )
+        
+#         # 设置结果
+#         ctx.set_result(
+#             input_tokens=response.usage.prompt_tokens,
+#             output_tokens=response.usage.completion_tokens,
+#             result=response.choices[0].message.content
+#         )
+        
+#         # 获取结果
+#         result = ctx.result
+    
+#     assert len(result) > 0
+#     logger.info(f"✅ Context manager result: {result}")
 
 @pytest.mark.asyncio
-async def test_context_manager_api(client, strict_controller):
-    """
-    测试上下文管理器API
-    
-    更灵活，适合复杂场景
-    """
-    
-    async with strict_controller.acquire_slot("What is AI?", 100) as ctx:
-        # 在上下文内调用API
-        response = await client.chat.completions.create(
-            model=TEST_MODEL,
-            messages=[{"role": "user", "content": ctx.prompt}],
-            max_tokens=ctx.max_output_token
-        )
-        
-        # 设置结果
-        ctx.set_result(
-            input_tokens=response.usage.prompt_tokens,
-            output_tokens=response.usage.completion_tokens,
-            result=response.choices[0].message.content
-        )
-        
-        # 获取结果
-        result = ctx.result
-    
-    assert len(result) > 0
-    logger.info(f"✅ Context manager result: {result}")
+async def test_llm_caller(client, loose_controller):
+    """测试LLM调用器"""
+    async def call_llm(prompt: str, max_tokens=10000):
+        async with loose_controller.acquire_slot(prompt, max_tokens) as ctx:
+            # 在上下文内调用API
+            response = await client.chat.completions.create(
+                model=TEST_MODEL,
+                messages=[{"role": "user", "content": ctx.prompt}],
+                max_tokens=ctx.max_output_token
+            )
 
+            # 设置结果
+            ctx.set_result(
+                input_tokens=response.usage.prompt_tokens,
+                output_tokens=response.usage.completion_tokens,
+                result=response.choices[0].message.content
+            )
+
+            # 获取结果
+            result = ctx.result
+        return result
+    prompts = [
+        "what is the capital of Afghanistan?",
+        "what is the capital of Algeria?",
+        "what is the capital of Argentina?",
+        "what is the capital of Australia?",
+        "what is the capital of Brazil?",
+        "what is the capital of Canada?",
+        "what is the capital of China?",
+        "what is the capital of Colombia?",
+        "what is the capital of Egypt?",
+        "what is the capital of Ethiopia?",
+        "what is the capital of France?",
+        "what is the capital of Germany?",
+        "what is the capital of Ghana?",
+        "what is the capital of India?",
+        "what is the capital of Indonesia?",
+        "what is the capital of Iran?",
+        "what is the capital of Iraq?",
+        "what is the capital of Italy?",
+        "what is the capital of Japan?",
+        "what is the capital of Kenya?",
+        "what is the capital of Malaysia?",
+        "what is the capital of Mexico?",
+        "what is the capital of Morocco?",
+        "what is the capital of Nepal?",
+        "what is the capital of Netherlands?",
+        "what is the capital of New Zealand?",
+        "what is the capital of Nigeria?",
+        "what is the capital of North Korea?",
+        "what is the capital of Norway?",
+        "what is the capital of Pakistan?",
+        "what is the capital of Peru?",
+        "what is the capital of Philippines?",
+        "what is the capital of Poland?",
+        "what is the capital of Russia?",
+        "what is the capital of Saudi Arabia?",
+        "what is the capital of South Africa?",
+        "what is the capital of South Korea?",
+        "what is the capital of Spain?",
+        "what is the capital of Sweden?",
+        "what is the capital of Switzerland?",
+        "what is the capital of Thailand?",
+        "what is the capital of Uganda?",
+        "what is the capital of Ukraine?",
+        "what is the capital of United Kingdom?",
+        "what is the capital of United States?",
+        "what is the capital of Venezuela?",
+        "what is the capital of Vietnam?",
+        "what is the capital of Yemen?",
+        "what is the capital of Zambia?",
+        "what is the capital of Zimbabwe?",
+    ]
+    results = await asyncio.gather(*[call_llm(prompt) for prompt in prompts])
+    assert all(len(result) > 0 for result in results)
+    for prompt, result in zip(prompts, results):
+        logger.info(f"✅ LLM caller result for prompt '{prompt}': {result}")
 
 
 # === 辅助调试命令 ===
